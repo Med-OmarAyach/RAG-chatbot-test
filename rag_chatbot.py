@@ -29,13 +29,7 @@ except ImportError:
 import psycopg2
 import psycopg2.pool
 import streamlit as st
-# Download NLTK data on first run (needed on Railway)
-import nltk
-for _pkg in ["punkt", "punkt_tab"]:
-    try:
-        nltk.data.find(f"tokenizers/{_pkg}")
-    except LookupError:
-        nltk.download(_pkg, quiet=True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
