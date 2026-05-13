@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+*.csv
+unified_commodity_newsF.csv
+dashboard.py
+pipeline.py
+*.ipynb

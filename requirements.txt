@@ -1,0 +1,7 @@
+streamlit>=1.32.0
+psycopg2-binary>=2.9.9
+sentence-transformers>=2.7.0
+openai>=1.30.0
+python-dotenv>=1.0.0
+nltk>=3.8.1
+pgvector>=0.2.4
