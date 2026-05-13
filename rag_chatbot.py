@@ -975,7 +975,7 @@ def render_chatbot(db_url: str = DB_URL):
     if n_embedded < 0:
         st.error("DB connection failed — check DATABASE_URL."); return
     if n_embedded == 0:
-        st.info("💡 No embeddings yet. Run: `python pipeline.py --no-scrape`"); return
+        st.info("💡 No embeddings yet. Run: `python pipeline.py --no-scrape`"); #return removed to test chunks embedding
 
     all_sources = load_sources(db_url)
     use_chunks  = chunks_table_exists(db_url)
