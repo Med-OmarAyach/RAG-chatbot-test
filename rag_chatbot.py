@@ -39,7 +39,13 @@ for _pkg in ["punkt", "punkt_tab"]:
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
+import os
+import streamlit as st
 
+st.write("### Debug")
+st.write(f"DATABASE_URL: `{os.environ.get('DATABASE_URL', 'NOT FOUND')[:50]}`")
+st.write(f"All env vars with DB: `{[k for k in os.environ.keys() if 'DB' in k or 'DATABASE' in k or 'POSTGRES' in k]}`")
+st.stop()
 DB_URL              = os.environ.get("DATABASE_URL", "")
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 NVIDIA_NIM_API_KEY  = os.environ.get("NVIDIA_NIM_API_KEY", "")
