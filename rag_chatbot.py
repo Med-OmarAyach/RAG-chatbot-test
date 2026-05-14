@@ -1176,7 +1176,10 @@ def render_chatbot(db_url: str = DB_URL):
         <b style="color:#7DC8C8">{n_embedded:,}</b> embedded ·
         <b style="color:#7DC8C8">{int(n_embedded/max(n_total,1)*100)}%</b> coverage
         </div>""", unsafe_allow_html=True)
-
+        # In sidebar, after your other controls:
+        if st.button("🔄 Refresh corpus stats", key="refresh_stats"):
+            st.cache_data.clear()  # Clears ALL cached functions
+            st.rerun()
         if st.session_state.chat_history:
             st.markdown("---")
             st.download_button(
