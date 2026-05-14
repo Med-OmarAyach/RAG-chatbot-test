@@ -1,6 +1,13 @@
 """
 rag_chatbot.py — DNEXT Intelligence SA · Advanced RAG Chatbot
 ═══════════════════════════════════════════════════════════════
+Retrieval strategy:
+  - DENSE  → article_chunks  (vector cosine via pgvector)
+             JOINs enriched_articles for metadata + temporal filters
+             Falls back to enriched_articles if chunks table is absent
+  - SPARSE → enriched_articles (search_tsv GIN index, full-text)
+             Temporal filters applied directly on published_date
+
 Per-step latency timing visible in the debug panel:
   - Query embedding time
   - Dense retrieval time
@@ -402,85 +409,150 @@ def _build_sparse_query(query: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DENSE RETRIEVAL
+# DENSE RETRIEVAL — always from article_chunks (with JOIN for temporal filters)
+# Falls back to enriched_articles if chunks table doesn't exist.
+#
+# Temporal filtering works because article_chunks JOINs enriched_articles and
+# filters on enriched_articles.published_date — no need to add the date column
+# to the chunks table itself.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _dense_retrieve(query, db_url, top_k, source_filter, date_from, date_to,
-                    use_chunks: bool = False) -> tuple[list[dict], int]:
+def _dense_retrieve(
+    query: str,
+    db_url: str,
+    top_k: int,
+    source_filter: Optional[list[str]],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    use_chunks: bool = True,          # True → chunk table; False → article fallback
+) -> tuple[list[dict], int]:
     t0 = time.perf_counter()
     vec_str = "[" + ",".join(str(x) for x in embed_text(query)) + "]"
-    filters: list[str] = []; params: list = []
 
     if use_chunks:
-        filters = ["c.embedding IS NOT NULL"]
+        # ── Chunk-based dense retrieval ──────────────────────────────────────
+        # JOIN brings in published_date, source, and all article metadata so
+        # temporal and source filters work exactly as they do on the article table.
+        # DISTINCT ON (a.id) keeps only the best-matching chunk per article so
+        # the fused result set is at the article level (consistent with sparse).
+        filters: list[str] = ["c.embedding IS NOT NULL"]
+        params:  list      = []
+
         if source_filter:
-            filters.append(f"a.source IN ({','.join(['%s']*len(source_filter))})"); params.extend(source_filter)
+            filters.append(f"a.source IN ({','.join(['%s']*len(source_filter))})")
+            params.extend(source_filter)
         if date_from:
-            filters.append("a.published_date >= %s"); params.append(date_from)
+            filters.append("a.published_date >= %s")
+            params.append(date_from)
         if date_to:
-            filters.append("a.published_date <= %s"); params.append(date_to)
+            filters.append("a.published_date <= %s")
+            params.append(date_to)
+
         where = "WHERE " + " AND ".join(filters)
+
         sql = f"""
             SELECT DISTINCT ON (a.id)
-                a.id, a.title, a.source, a.published_date, a.url,
-                COALESCE(a.summary,LEFT(a.content,{MAX_CONTEXT_CHARS})) AS summary,
-                LEFT(a.content,800) AS content,
-                COALESCE(a.overall_sentiment,'neutral') AS overall_sentiment,
-                COALESCE(a.sentiment_score,0.0) AS sentiment_score,
-                a.commodities, c.chunk_text AS matched_chunk, c.chunk_index,
-                1-(c.embedding <=> %s::vector) AS similarity
-            FROM article_chunks c JOIN enriched_articles a ON c.article_id=a.id
-            {where} ORDER BY a.id, c.embedding <=> %s::vector LIMIT %s;
+                a.id,
+                a.title,
+                a.source,
+                a.published_date,
+                a.url,
+                COALESCE(a.summary, LEFT(a.content, {MAX_CONTEXT_CHARS})) AS summary,
+                LEFT(a.content, 800)                                       AS content,
+                COALESCE(a.overall_sentiment, 'neutral')                   AS overall_sentiment,
+                COALESCE(a.sentiment_score, 0.0)                           AS sentiment_score,
+                a.commodities,
+                c.chunk_text   AS matched_chunk,
+                c.chunk_index,
+                1 - (c.embedding <=> %s::vector)                           AS similarity
+            FROM article_chunks c
+            JOIN enriched_articles a ON c.article_id = a.id
+            {where}
+            ORDER BY a.id, c.embedding <=> %s::vector   -- best chunk per article
+            LIMIT %s;
         """
+        # param order: vec (for similarity expr), source/date filters, vec (for ORDER BY), limit
+        full_params = [vec_str] + params + [vec_str, top_k]
+
     else:
+        # ── Article-level fallback (no chunks table) ─────────────────────────
         filters = ["embedding IS NOT NULL"]
+        params  = []
+
         if source_filter:
-            filters.append(f"source IN ({','.join(['%s']*len(source_filter))})"); params.extend(source_filter)
+            filters.append(f"source IN ({','.join(['%s']*len(source_filter))})")
+            params.extend(source_filter)
         if date_from:
-            filters.append("published_date >= %s"); params.append(date_from)
+            filters.append("published_date >= %s")
+            params.append(date_from)
         if date_to:
-            filters.append("published_date <= %s"); params.append(date_to)
+            filters.append("published_date <= %s")
+            params.append(date_to)
+
         where = "WHERE " + " AND ".join(filters)
+
         sql = f"""
-            SELECT id, title, source, published_date, url,
-                   COALESCE(summary,LEFT(content,{MAX_CONTEXT_CHARS})) AS summary,
-                   LEFT(content,800) AS content,
-                   COALESCE(overall_sentiment,'neutral') AS overall_sentiment,
-                   COALESCE(sentiment_score,0.0) AS sentiment_score,
-                   commodities, NULL AS matched_chunk, NULL AS chunk_index,
-                   1-(embedding <=> %s::vector) AS similarity
-            FROM enriched_articles {where}
-            ORDER BY embedding <=> %s::vector LIMIT %s;
+            SELECT
+                id,
+                title,
+                source,
+                published_date,
+                url,
+                COALESCE(summary, LEFT(content, {MAX_CONTEXT_CHARS})) AS summary,
+                LEFT(content, 800)                                     AS content,
+                COALESCE(overall_sentiment, 'neutral')                 AS overall_sentiment,
+                COALESCE(sentiment_score, 0.0)                         AS sentiment_score,
+                commodities,
+                NULL  AS matched_chunk,
+                NULL  AS chunk_index,
+                1 - (embedding <=> %s::vector)                         AS similarity
+            FROM enriched_articles
+            {where}
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s;
         """
+        full_params = [vec_str] + params + [vec_str, top_k]
 
     conn = None
     try:
         conn = get_conn(db_url)
         with conn.cursor() as cur:
-            cur.execute(sql, [vec_str] + params + [vec_str, top_k])
+            cur.execute(sql, full_params)
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-        for r in rows: r["_retriever"] = "dense"
+        for r in rows:
+            r["_retriever"] = "dense"
         return rows, ms(t0)
-    except Exception:
+    except Exception as e:
+        st.warning(f"Dense retrieval error: {e}")
         return [], ms(t0)
     finally:
-        if conn: release_conn(db_url, conn)
+        if conn:
+            release_conn(db_url, conn)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SPARSE RETRIEVAL
+# SPARSE RETRIEVAL — always from enriched_articles via search_tsv GIN index
+# Temporal filters applied directly on published_date (column lives here).
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _sparse_retrieve(query, db_url, top_k, source_filter, date_from, date_to) -> tuple[list[dict], int]:
+def _sparse_retrieve(
+    query: str,
+    db_url: str,
+    top_k: int,
+    source_filter: Optional[list[str]],
+    date_from: Optional[str],
+    date_to: Optional[str],
+) -> tuple[list[dict], int]:
     t0 = time.perf_counter()
 
     tsquery_str = _build_sparse_query(query)
     if not tsquery_str:
         return [], ms(t0)
 
-    conditions = []
-    params = []
+    conditions: list[str] = []
+    params:     list      = []
+
     if source_filter:
         conditions.append(f"source IN ({','.join(['%s'] * len(source_filter))})")
         params.extend(source_filter)
@@ -493,36 +565,45 @@ def _sparse_retrieve(query, db_url, top_k, source_filter, date_from, date_to) ->
 
     filter_clause = ("AND " + " AND ".join(conditions)) if conditions else ""
 
-    # Uses idx_enriched_search_gin (stored search_tsv column) — no recomputation overhead
+    # Uses idx_enriched_search_gin (stored search_tsv column) — no recompute overhead.
+    # NULL placeholders keep the result schema identical to the dense path so
+    # RRF fusion can merge on article id without special-casing.
     sql = f"""
-        SELECT id, title, source, published_date, url,
-               COALESCE(summary, LEFT(content, {MAX_CONTEXT_CHARS})) AS summary,
-               LEFT(content, 800) AS content,
-               COALESCE(overall_sentiment, 'neutral') AS overall_sentiment,
-               COALESCE(sentiment_score, 0.0) AS sentiment_score,
-               commodities,
-               ts_rank(search_tsv, to_tsquery('english', %s)) AS similarity
+        SELECT
+            id,
+            title,
+            source,
+            published_date,
+            url,
+            COALESCE(summary, LEFT(content, {MAX_CONTEXT_CHARS})) AS summary,
+            LEFT(content, 800)                                     AS content,
+            COALESCE(overall_sentiment, 'neutral')                 AS overall_sentiment,
+            COALESCE(sentiment_score, 0.0)                         AS sentiment_score,
+            commodities,
+            NULL::text    AS matched_chunk,
+            NULL::integer AS chunk_index,
+            ts_rank(search_tsv, to_tsquery('english', %s))         AS similarity
         FROM enriched_articles
         WHERE search_tsv @@ to_tsquery('english', %s)
         {filter_clause}
         ORDER BY similarity DESC
         LIMIT %s;
     """
-    # params: [tsquery for rank, tsquery for WHERE, ...filters, limit]
-    params_full = [tsquery_str, tsquery_str] + params + [top_k]
+    # param order: tsquery (rank), tsquery (WHERE), source/date filters, limit
+    full_params = [tsquery_str, tsquery_str] + params + [top_k]
 
     conn = None
     try:
         conn = get_conn(db_url)
         with conn.cursor() as cur:
-            cur.execute(sql, params_full)
+            cur.execute(sql, full_params)
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, row)) for row in cur.fetchall()]
         for r in rows:
             r["_retriever"] = "sparse"
         return rows, ms(t0)
     except Exception as e:
-        print(f"Sparse search error: {e}")
+        st.warning(f"Sparse retrieval error: {e}")
         return [], ms(t0)
     finally:
         if conn:
@@ -536,23 +617,38 @@ def _sparse_retrieve(query, db_url, top_k, source_filter, date_from, date_to) ->
 # exact keyword matches more.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def rrf_fusion(dense, sparse, k=RRF_K, top_n=MAX_FINAL_DOCS,
-               dense_weight=2.0, sparse_weight=2.0) -> tuple[list[dict], int]:
+def rrf_fusion(
+    dense: list[dict],
+    sparse: list[dict],
+    k: int = RRF_K,
+    top_n: int = MAX_FINAL_DOCS,
+    dense_weight: float = 2.0,
+    sparse_weight: float = 2.0,
+) -> tuple[list[dict], int]:
     t0 = time.perf_counter()
-    scores: dict[str, float] = {}; docs: dict[str, dict] = {}
+    scores: dict[str, float] = {}
+    docs:   dict[str, dict]  = {}
+
     for rank, d in enumerate(dense, 1):
         did = str(d["id"])
-        scores[did] = scores.get(did, 0) + dense_weight / (k + rank)
-        docs[did] = d
+        scores[did] = scores.get(did, 0.0) + dense_weight / (k + rank)
+        docs[did]   = d
+
     for rank, d in enumerate(sparse, 1):
         did = str(d["id"])
-        scores[did] = scores.get(did, 0) + sparse_weight / (k + rank)
-        if did not in docs: docs[did] = d
-        else: docs[did]["_retriever"] = "hybrid"
+        scores[did] = scores.get(did, 0.0) + sparse_weight / (k + rank)
+        if did not in docs:
+            docs[did] = d
+        else:
+            # article appeared in both → mark as hybrid and keep chunk info from dense
+            docs[did]["_retriever"] = "hybrid"
+
     ranked = sorted(scores, key=lambda x: scores[x], reverse=True)
     result = []
     for did in ranked[:top_n]:
-        d = docs[did].copy(); d["_rrf_score"] = scores[did]; result.append(d)
+        d = docs[did].copy()
+        d["_rrf_score"] = scores[did]
+        result.append(d)
     return result, ms(t0)
 
 
@@ -638,7 +734,11 @@ def build_context(articles: list[dict]) -> tuple[str, int]:
             except Exception:
                 pass
         matched = str(a.get("matched_chunk", "") or "").strip()
-        chunk_section = f"Matched passage: {matched[:300]}\n" if matched and matched not in summary else ""
+        chunk_section = (
+            f"Matched passage: {matched[:300]}\n"
+            if matched and matched not in summary
+            else ""
+        )
         blocks.append(
             f"[Article {i}]\n"
             f"Source: {a.get('source','')} | Date: {date_str} | "
@@ -655,11 +755,17 @@ def build_context(articles: list[dict]) -> tuple[str, int]:
 # MAIN RETRIEVE ORCHESTRATOR
 # ─────────────────────────────────────────────────────────────────────────────
 
-def retrieve(question, db_url, top_k=DEFAULT_TOP_K,
-             source_filter=None, date_from=None, date_to=None,
-             use_chunks=False) -> tuple[list[dict], str, dict]:
+def retrieve(
+    question:      str,
+    db_url:        str,
+    top_k:         int            = DEFAULT_TOP_K,
+    source_filter: Optional[list] = None,
+    date_from:     Optional[str]  = None,
+    date_to:       Optional[str]  = None,
+    use_chunks:    bool           = False,   # set by chunks_table_exists() at startup
+) -> tuple[list[dict], str, dict]:
     pipeline_start = time.perf_counter()
-    debug: dict    = {"timing_ms": {}}
+    debug: dict = {"timing_ms": {}}
     T = debug["timing_ms"]
 
     # ── Step 1: Temporal parsing ──────────────────────────────────────────────
@@ -669,8 +775,10 @@ def retrieve(question, db_url, top_k=DEFAULT_TOP_K,
     eff_to   = date_to   or auto_to
     T["1_temporal_parse"] = ms(t0)
     debug["temporal"] = {
-        "auto_from": auto_from, "auto_to": auto_to,
-        "effective_from": eff_from, "effective_to": eff_to,
+        "auto_from":      auto_from,
+        "auto_to":        auto_to,
+        "effective_from": eff_from,
+        "effective_to":   eff_to,
     }
 
     # ── Step 2: Query rewriting ───────────────────────────────────────────────
@@ -685,15 +793,23 @@ def retrieve(question, db_url, top_k=DEFAULT_TOP_K,
     T["3_embedding"] = ms(t0)
     debug["embedding_cached"] = T["3_embedding"] < 10
 
-    # ── Step 4: Dense + sparse retrieval (sequential — faster on local DB) ────
-    # ThreadPoolExecutor removed: local PostgreSQL has ~0ms network latency so
-    # thread overhead costs more than the parallelism saves.
+    # ── Step 4: Dense (chunks or articles) + Sparse (always articles) ─────────
+    # Dense always uses article_chunks when available — temporal filters work
+    # through the JOIN to enriched_articles.published_date.
+    # Sparse always uses enriched_articles.search_tsv GIN index — temporal
+    # filters are applied directly on published_date.
     t0 = time.perf_counter()
 
-    dense_r,  dense_ms  = _dense_retrieve(rewritten, db_url, top_k,
-                                           source_filter, eff_from, eff_to, use_chunks)
-    sparse_r, sparse_ms = _sparse_retrieve(rewritten, db_url, top_k,
-                                            source_filter, eff_from, eff_to)
+    dense_r,  dense_ms  = _dense_retrieve(
+        rewritten, db_url, top_k,
+        source_filter, eff_from, eff_to,
+        use_chunks=use_chunks,          # True  → chunk table + JOIN
+                                        # False → article table (fallback)
+    )
+    sparse_r, sparse_ms = _sparse_retrieve(
+        rewritten, db_url, top_k,
+        source_filter, eff_from, eff_to,
+    )
 
     T["4a_dense_retrieval"]  = dense_ms
     T["4b_sparse_retrieval"] = sparse_ms
@@ -701,10 +817,13 @@ def retrieve(question, db_url, top_k=DEFAULT_TOP_K,
     debug["dense_count"]     = len(dense_r)
     debug["sparse_count"]    = len(sparse_r)
     debug["used_chunks"]     = use_chunks
-    debug["sparse_query"]    = _build_sparse_query(rewritten)  # visible in debug panel
+    debug["sparse_query"]    = _build_sparse_query(rewritten)
 
     # Confidence gate on dense similarity
-    top_sim = max((float(r.get("similarity", 0) or 0) for r in dense_r), default=0.0)
+    top_sim = max(
+        (float(r.get("similarity", 0) or 0) for r in dense_r),
+        default=0.0,
+    )
     debug["top_similarity"] = round(top_sim, 4)
     debug["confidence_ok"]  = top_sim >= CONFIDENCE_THRESHOLD
 
@@ -735,8 +854,10 @@ def retrieve(question, db_url, top_k=DEFAULT_TOP_K,
 # STREAMING GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def stream_answer(question, context, history, placeholder,
-                  backend, model, temperature, max_tokens) -> tuple[str, float, dict]:
+def stream_answer(
+    question, context, history, placeholder,
+    backend, model, temperature, max_tokens,
+) -> tuple[str, float, dict]:
     timing: dict = {}
     messages = [
         {"role": "system",  "content": SYSTEM_PROMPT},
@@ -827,8 +948,8 @@ def render_source_cards(articles):
         ret_label   = {"dense":"🔵 vector","sparse":"🟡 keyword","hybrid":"🟢 hybrid"}.get(ret, ret)
         chunk_badge = (f'<span class="chunk-pill">chunk {a.get("chunk_index","")+1}</span>'
                        if a.get("matched_chunk") else "")
-        # Build full HTML outside the f-string — no conditionals inside markdown
-        compr_badge = '<span style="font-size:0.7rem;color:#a0b8c4"> · ✂️ compressed</span>' if a.get("_compressed") else ""
+        compr_badge = ('<span style="font-size:0.7rem;color:#a0b8c4"> · ✂️ compressed</span>'
+                       if a.get("_compressed") else "")
 
         card_html = (
             f'<div class="source-card {sent}">'
@@ -888,12 +1009,13 @@ def render_debug(debug: dict):
         + '</div></div>'
     )
 
-    mode = "chunks" if debug.get("used_chunks") else "articles"
+    mode = "chunks → article JOIN" if debug.get("used_chunks") else "article-level (no chunks)"
     retrieval_html = (
         '<div class="debug-section">'
         '<div class="debug-section-title">Retrieval</div>'
         '<div class="debug-table">'
-        + row("Mode",           mode)
+        + row("Dense mode",     mode)
+        + row("Sparse mode",    "enriched_articles (search_tsv)")
         + row("Dense hits",     debug.get("dense_count", 0),  "4a_dense_retrieval")
         + row("Sparse hits",    debug.get("sparse_count", 0), "4b_sparse_retrieval")
         + row("Total retrieval wall", "",                      "4_retrieval_wall")
@@ -975,9 +1097,11 @@ def render_chatbot(db_url: str = DB_URL):
     if n_embedded < 0:
         st.error("DB connection failed — check DATABASE_URL."); return
     if n_embedded == 0:
-        st.info("💡 No embeddings yet. Run: `python pipeline.py --no-scrape`"); #return removed to test chunks embedding
+        st.info("💡 No embeddings yet. Run: `python pipeline.py --no-scrape`")
 
     all_sources = load_sources(db_url)
+    # use_chunks drives DENSE retrieval mode only.
+    # Sparse always stays on enriched_articles regardless of this flag.
     use_chunks  = chunks_table_exists(db_url)
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
@@ -1032,15 +1156,20 @@ def render_chatbot(db_url: str = DB_URL):
         max_tokens  = st.slider("Max tokens",  256, 2048, 1024, 128,  key="maxtok_slider")
         st.markdown("---")
 
-        if GROQ_API_KEY:   st.success("🚀 Groq ready")
-        if use_chunks:     st.success("📦 Chunk retrieval active")
-        else:              st.info("📄 Article-level retrieval")
+        if GROQ_API_KEY: st.success("🚀 Groq ready")
+        if use_chunks:
+            st.success("📦 Dense: chunk retrieval (JOIN) · Sparse: article index")
+        else:
+            st.info("📄 Dense: article-level · Sparse: article index")
 
         st.markdown(f"""
         <div style="font-size:0.68rem;color:#5a8fa0;line-height:2;margin-top:0.5rem">
-        🔵 Dense · pgvector cosine<br>🟡 Sparse · inverted index (search_tsv)<br>
-        🟢 RRF · equal-weight fusion<br>🕐 Auto temporal detection<br>
-        ✂️ Contextual compression<br>⚡ Token streaming<br>
+        🔵 Dense · {"chunk pgvector + article JOIN" if use_chunks else "article pgvector"}<br>
+        🟡 Sparse · enriched_articles search_tsv GIN<br>
+        🟢 RRF · equal-weight fusion<br>
+        🕐 Auto temporal detection (filters via JOIN)<br>
+        ✂️ Contextual compression<br>
+        ⚡ Token streaming<br>
         🔧 Per-step latency timing
         </div>
         <div style="margin-top:0.8rem;font-size:0.68rem;color:#5a8fa0">
@@ -1062,12 +1191,12 @@ def render_chatbot(db_url: str = DB_URL):
                 st.rerun()
 
     # ── Chat header ───────────────────────────────────────────────────────────
+    dense_label = "Chunk dense + Article sparse" if use_chunks else "Article dense + sparse"
     st.markdown(f"""
     <div class="chat-header">
         <div class="chat-header-title">🌾 DNEXT Commodity Chat</div>
         <div class="chat-header-sub">
-            Hybrid RAG · Dense + Sparse + RRF ·
-            {"Chunk" if use_chunks else "Article"} retrieval ·
+            Hybrid RAG · {dense_label} · RRF fusion ·
             {n_embedded:,} articles · Streaming · Per-step timing
         </div>
     </div>""", unsafe_allow_html=True)
@@ -1151,6 +1280,8 @@ def render_chatbot(db_url: str = DB_URL):
                 hints.append("⚡ embedding cached")
             if debug.get("sparse_count", 0) > 0:
                 hints.append(f"🟡 {debug['sparse_count']} keyword hits")
+            if debug.get("used_chunks"):
+                hints.append("📦 chunk dense")
             if hints:
                 hint_ph.markdown(
                     " &nbsp;·&nbsp; ".join(f'<span class="hint-row">{h}</span>' for h in hints),
@@ -1158,7 +1289,8 @@ def render_chatbot(db_url: str = DB_URL):
                 )
 
             if not articles:
-                answer = "I couldn't find relevant articles for that question."; latency = 0.0; llm_timing = {}
+                answer = "I couldn't find relevant articles for that question."
+                latency = 0.0; llm_timing = {}
                 answer_ph.markdown(answer)
             elif not debug.get("confidence_ok", True):
                 answer = (f"⚠️ Best similarity: **{debug.get('top_similarity',0):.3f}** "
