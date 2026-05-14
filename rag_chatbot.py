@@ -273,8 +273,7 @@ def load_sources(db_url: str) -> list[str]:
     try:
         conn = get_conn(db_url)
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT source FROM enriched_articles "
-                        "WHERE embedding IS NOT NULL ORDER BY source;")
+            cur.execute("SELECT DISTINCT source FROM enriched_articles; ")
             return [r[0] for r in cur.fetchall()]
     except Exception:
         return ["ADMISI", "Brownfield", "Mecardo", "USDA", "AHDB"]
@@ -1097,7 +1096,8 @@ def render_chatbot(db_url: str = DB_URL):
     if n_embedded < 0:
         st.error("DB connection failed — check DATABASE_URL."); return
     if n_embedded == 0:
-        st.info("💡 No embeddings yet. Run: `python pipeline.py --no-scrape`")
+        #st.info("💡 No embeddings yet. Run: `python pipeline.py --no-scrape`")
+        pass
 
     all_sources = load_sources(db_url)
     # use_chunks drives DENSE retrieval mode only.
